@@ -1,0 +1,8 @@
+machine_learning_types.png:
+https://www.researchgate.net/publication/354960266_Machine_Learning_Techniques_for_Personalised_Medicine_Approaches_in_Immune-Mediated_Chronic_Inflammatory_Diseases_Applications_and_Challenges
+
+iris-flowers.png
+https://codesignal.com/learn/courses/intro-to-unsupervised-machine-learning/lessons/exploring-and-visualizing-the-iris-dataset
+
+trolley-cart.webp
+http://shikharsachdev.com/trolley-problem/
