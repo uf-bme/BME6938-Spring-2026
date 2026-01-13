@@ -6,3 +6,6 @@ https://codesignal.com/learn/courses/intro-to-unsupervised-machine-learning/less
 
 trolley-cart.webp
 http://shikharsachdev.com/trolley-problem/
+
+titanic.jpg
+https://www.kaggle.com/datasets/yasserh/titanic-dataset
