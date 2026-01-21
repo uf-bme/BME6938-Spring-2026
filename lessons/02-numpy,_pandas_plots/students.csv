@@ -1,0 +1,6 @@
+Name,Age,Grade,Score,Pass,Score_Category
+Alice,20,A,85,True,Good
+Bob,21,B+,92,True,Excellent
+Charlie,19,B,78,False,Needs Improvement
+Diana,22,A+,96,True,Excellent
+Eve,20,A-,88,True,Good
