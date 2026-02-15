@@ -1,2 +1,4 @@
 .venv/
 lessons/01-Welcome/training-kit/
+node_modules/
+__pycache__/
