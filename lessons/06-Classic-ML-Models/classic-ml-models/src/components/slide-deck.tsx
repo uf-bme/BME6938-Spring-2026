@@ -799,6 +799,11 @@ const slides = [
           <div className="bg-purple-50 rounded-lg p-3 text-center"><strong className="text-purple-600">Hidden layers:</strong><br/>Learn representations (ReLU)</div>
           <div className="bg-red-50 rounded-lg p-3 text-center"><strong className="text-red-600">Output layer:</strong><br/>Sigmoid (binary) or Softmax (multi-class)</div>
         </div>
+        <div className="mt-4 text-center">
+          <a href="https://playground.tensorflow.org/#activation=linear&batchSize=10&dataset=gauss&regDataset=reg-plane&learningRate=0.03&regularizationRate=0&noise=0&networkShape=1&seed=0.25736&showTestData=false&discretize=false&percTrainData=50&x=true&y=true&xTimesY=false&xSquared=false&ySquared=false&cosX=false&sinX=false&cosY=false&sinY=false&collectStats=false&problem=classification&initZero=false&hideText=false" target="_blank" rel="noopener noreferrer" className="inline-block px-6 py-2 bg-purple-600 text-white rounded-lg font-semibold hover:bg-purple-700 transition">
+            Try it: TensorFlow Playground
+          </a>
+        </div>
       </div>
     )
   },
