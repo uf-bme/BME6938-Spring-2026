@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
+import 'katex/dist/katex.min.css'; // Don't forget the CSS
+
 import { BlockMath, InlineMath } from "react-katex";
+
+const tex = String.raw;
 
 const slides = [
   // TITLE SLIDE
@@ -75,13 +79,13 @@ const slides = [
             </p>
             <div className="bg-gray-100 rounded-xl p-4 mt-4">
               <div className="text-center text-lg">
-                <InlineMath math={"z = w_1x_1 + w_2x_2 + \\cdots + w_nx_n + b"} />
+                <InlineMath math={tex`z = w_1 x_1 + w_2 x_2 + \cdots + w_n x_n + b`} />
               </div>
               <div className="text-center text-lg mt-2">
-                <InlineMath math={"\\sigma(z) = \\frac{1}{1 + e^{-z}}"} />
+                <InlineMath math={tex`\sigma(z) = \frac{1}{1 + e^{-z}}`} />
               </div>
               <div className="text-center text-lg mt-2">
-                <InlineMath math={"\\hat{y} = \\sigma(z) \\in [0,1]"} />
+                <InlineMath math={tex`\hat{y} = \sigma(z) \in [0,1]`} />
               </div>
             </div>
             <p className="text-gray-600 text-sm mt-4">
