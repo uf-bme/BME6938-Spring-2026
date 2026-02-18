@@ -1,6 +1,6 @@
 """
-Run:
-  pip install gradio
+How to run:
+  pip install gradio numpy pandas matplotlib scikit-learn
   python app.py
 """
 
@@ -10,17 +10,19 @@ import hashlib
 import json
 import tempfile
 import warnings
-from typing import Any, Dict, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any
 
 import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.datasets import load_breast_cancer, load_digits
+from sklearn.datasets import fetch_openml, load_breast_cancer
 from sklearn.decomposition import PCA
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.manifold import TSNE
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -36,80 +38,145 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-TRAIN_CACHE: Dict[str, Dict[str, Any]] = {}
+TRAIN_CACHE: dict[str, dict[str, Any]] = {}
+_DATASET_CACHE: dict[str, dict[str, Any]] = {}
+FASHION_SUBSET_SIZE = 800  # fixed stratified subset for in-class speed
 
 
-def load_dataset(name: str) -> Dict[str, Any]:
-    dataset_name = (name or "Breast Cancer").strip().lower()
+@dataclass
+class RunConfig:
+    dataset: str
+    test_size: float
+    random_seed: int
+    standardize_features: bool
+    use_pca_fashion: bool
+    pca_components: int
+    fast_mode: bool
+    logreg_c: float
+    logreg_max_iter: int
+    rf_n_estimators: int
+    rf_max_depth: int
+    gb_n_estimators: int
+    gb_learning_rate: float
+    mlp_hidden_layer_sizes: str
+    mlp_alpha: float
+    mlp_max_iter: int
+    mlp_early_stopping: bool
 
-    if dataset_name == "breast cancer":
+
+def _to_dataframe(X: Any, feature_names: list[str]) -> pd.DataFrame:
+    if isinstance(X, pd.DataFrame):
+        return X.copy()
+    return pd.DataFrame(X, columns=feature_names)
+
+
+def load_dataset(name: str) -> dict[str, Any]:
+    key = (name or "Breast Cancer").strip().lower()
+    if key in _DATASET_CACHE:
+        return _DATASET_CACHE[key]
+
+    if key == "breast cancer":
         data = load_breast_cancer(as_frame=True)
         X = data.data.copy()
-        y = pd.Series(data.target, name="target")
-        target_names = ["Malignant", "Benign"]
-        return {
+       
+        # y_fashion_sub = y_fashion[subset_indices]
+
+        y = pd.Series(data.target, name="target").astype(int)
+        bundle = {
             "name": "Breast Cancer",
             "X": X,
             "y": y,
             "feature_names": list(X.columns),
-            "target_names": target_names,
+            "target_names": ["Malignant", "Benign"],
             "num_classes": int(y.nunique()),
             "task_type": "binary",
             "image_shape": None,
         }
+        _DATASET_CACHE[key] = bundle
+        return bundle
 
-    if dataset_name == "digits":
-        data = load_digits()
-        feature_names = [f"px_{idx}" for idx in range(data.data.shape[1])]
-        X = pd.DataFrame(data.data, columns=feature_names)
-        y = pd.Series(data.target, name="digit")
-        target_names = [str(label) for label in sorted(y.unique())]
-        return {
-            "name": "Digits",
+    if key == "fashion-mnist":
+        data = fetch_openml("Fashion-MNIST", version=1, as_frame=False, parser="auto")
+        X_np = data.data.copy()
+        y_np = np.asarray(data.target).astype(int)
+        feature_names = [f"px_{i}" for i in range(X_np.shape[1])]
+
+        rng = np.random.RandomState(42)
+        subset_indices = []
+        per_class = FASHION_SUBSET_SIZE // 10
+        for label in range(10):
+            label_idx = np.where(y_np == label)[0]
+            if len(label_idx) < per_class:
+                chosen = rng.choice(label_idx, size=per_class, replace=True)
+            else:
+                chosen = rng.choice(label_idx, size=per_class, replace=False)
+            subset_indices.append(chosen)
+        subset_indices = np.concatenate(subset_indices)
+        rng.shuffle(subset_indices)
+
+        X = _to_dataframe(X_np[subset_indices], feature_names)
+        y_fashion_sub = y_np[subset_indices]
+        y = pd.Series(y_fashion_sub, name="label")
+
+        bundle = {
+            "name": "Fashion-MNIST",
             "X": X,
             "y": y,
             "feature_names": feature_names,
-            "target_names": target_names,
+            "target_names": [str(i) for i in sorted(y.unique())],
             "num_classes": int(y.nunique()),
             "task_type": "multiclass",
-            "image_shape": (8, 8),
+            "image_shape": (28, 28),
         }
+        _DATASET_CACHE[key] = bundle
+        return bundle
 
     raise ValueError(f"Unsupported dataset: {name}")
 
 
-def _make_class_distribution_plot(y: pd.Series, title: str) -> plt.Figure:
-    class_counts = y.value_counts().sort_index()
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-    ax.bar(class_counts.index.astype(str), class_counts.values)
+
+
+
+def _class_distribution_fig(y: pd.Series, title: str) -> plt.Figure:
+    counts = y.value_counts().sort_index()
+    fig, ax = plt.subplots(figsize=(6.4, 3.6))
+    ax.bar(counts.index.astype(str), counts.values)
     ax.set_title(title)
     ax.set_xlabel("Class")
     ax.set_ylabel("Count")
-    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _make_breast_corr_heatmap(X: pd.DataFrame, y: pd.Series, top_k: int) -> plt.Figure:
+def _breast_corr_heatmap(X: pd.DataFrame, y: pd.Series, top_k: int) -> plt.Figure:
     joined = X.copy()
     joined["target"] = y
-    corrs = joined.corr(numeric_only=True)["target"].drop("target").abs().sort_values(ascending=False)
-    selected = list(corrs.head(max(2, top_k)).index)
-    corr_matrix = X[selected].corr(numeric_only=True)
+    top = (
+        joined.corr(numeric_only=True)["target"]
+        .drop("target")
+        .abs()
+        .sort_values(ascending=False)
+        .head(max(2, int(top_k)))
+    )
+    cols = list(top.index)
+    corr = X[cols].corr(numeric_only=True)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(corr_matrix.values, cmap="coolwarm", vmin=-1, vmax=1)
-    ax.set_title(f"Correlation Heatmap (Top {len(selected)} Features)")
-    ax.set_xticks(np.arange(len(selected)))
-    ax.set_xticklabels(selected, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(np.arange(len(selected)))
-    ax.set_yticklabels(selected, fontsize=8)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig, ax = plt.subplots(figsize=(7.0, 5.4))
+    im = ax.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_title(f"Breast Cancer Correlation Heatmap (Top {len(cols)})")
+    ax.set_xticks(np.arange(len(cols)))
+    ax.set_yticks(np.arange(len(cols)))
+    ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(cols, fontsize=8)
+    fig.colorbar(im, ax=ax, fraction=0.045, pad=0.04)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _make_breast_feature_histograms(
+def _breast_hist_pair(
     X: pd.DataFrame,
     y: pd.Series,
     feature_1: str,
@@ -119,218 +186,250 @@ def _make_breast_feature_histograms(
     f1 = feature_1 if feature_1 in X.columns else X.columns[0]
     f2 = feature_2 if feature_2 in X.columns else X.columns[min(1, len(X.columns) - 1)]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
-    classes = sorted(y.unique())
-
-    for cls in classes:
-        cls_mask = y == cls
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 3.8))
+    for cls in sorted(y.unique()):
+        mask = y == cls
         label = target_names[int(cls)] if int(cls) < len(target_names) else str(cls)
-        axes[0].hist(X.loc[cls_mask, f1], bins=30, alpha=0.6, label=label)
-        axes[1].hist(X.loc[cls_mask, f2], bins=30, alpha=0.6, label=label)
+        axes[0].hist(X.loc[mask, f1], bins=30, alpha=0.65, label=label)
+        axes[1].hist(X.loc[mask, f2], bins=30, alpha=0.65, label=label)
 
     axes[0].set_title(f"Histogram: {f1}")
     axes[1].set_title(f"Histogram: {f2}")
-    for axis in axes:
-        axis.set_xlabel("Value")
-        axis.set_ylabel("Frequency")
-        axis.grid(alpha=0.25)
+    for ax in axes:
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Frequency")
+        ax.grid(alpha=0.25)
     axes[1].legend(loc="best")
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _make_digits_image_grid(X: pd.DataFrame, y: pd.Series, image_shape: Tuple[int, int]) -> plt.Figure:
-    fig, axes = plt.subplots(2, 5, figsize=(9, 4.5))
-    axes = axes.ravel()
+def _fashion_image_grid(
+    X: pd.DataFrame,
+    y: pd.Series,
+    image_shape: tuple[int, int],
+    n_rows: int = 2,
+    n_cols: int = 5,
+) -> plt.Figure:
+    classes = sorted(y.unique())
+    n_needed = n_rows * n_cols
+    rng = np.random.default_rng(42)
 
-    for digit in range(10):
-        idx = int(np.where(y.values == digit)[0][0])
-        image = X.iloc[idx].values.reshape(image_shape)
-        axes[digit].imshow(image, cmap="gray")
-        axes[digit].set_title(f"Digit {digit}")
-        axes[digit].axis("off")
+    chosen_idx: list[int] = []
+    per_class = max(1, n_needed // len(classes))
+    for cls in classes:
+        idx = np.where(y.values == cls)[0]
+        take = min(len(idx), per_class)
+        if take > 0:
+            chosen_idx.extend(rng.choice(idx, size=take, replace=False).tolist())
 
-    fig.suptitle("Digits Sample Images", y=1.02)
+    if len(chosen_idx) < n_needed:
+        all_idx = np.arange(len(X))
+        extras = rng.choice(all_idx, size=n_needed - len(chosen_idx), replace=False)
+        chosen_idx.extend(extras.tolist())
+
+    chosen_idx = chosen_idx[:n_needed]
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10.0, 4.6))
+    axes = np.asarray(axes).ravel()
+    for i, idx in enumerate(chosen_idx):
+        img = X.iloc[idx].to_numpy().reshape(image_shape)
+        lbl = int(y.iloc[idx])
+        axes[i].imshow(img, cmap="gray")
+        axes[i].set_title(f"Label {lbl}")
+        axes[i].axis("off")
+
+    fig.suptitle("Fashion-MNIST Sample Image Grid", y=1.01)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _make_digits_pca_plot(X: pd.DataFrame, y: pd.Series, max_points: int = 1000) -> plt.Figure:
-    total = len(X)
-    if total > max_points:
+def _fashion_tsne_scatter(X: pd.DataFrame, y: pd.Series, max_points: int = 2500) -> plt.Figure:
+    if len(X) > max_points:
         rng = np.random.default_rng(42)
-        subset_idx = rng.choice(total, size=max_points, replace=False)
-        X_sub = X.iloc[subset_idx]
-        y_sub = y.iloc[subset_idx]
+        idx = rng.choice(len(X), size=max_points, replace=False)
+        X_sub = X.iloc[idx]
+        y_sub = y.iloc[idx]
     else:
         X_sub = X
         y_sub = y
 
-    pca = PCA(n_components=2, random_state=42)
-    points = pca.fit_transform(X_sub)
+    # t-SNE is sensitive to scaling; standardize for a more stable visualization.
+    X_scaled = StandardScaler().fit_transform(X_sub.to_numpy())
 
-    fig, ax = plt.subplots(figsize=(6.5, 4.8))
+    n_samples = int(X_scaled.shape[0])
+    # Perplexity must be < n_samples; keep it reasonable for speed.
+    perplexity = min(30, max(5, (n_samples - 1) // 3))
+
+    points = TSNE(
+        n_components=2,
+        init="pca",
+        learning_rate="auto",
+        perplexity=perplexity,
+        random_state=42,
+    ).fit_transform(X_scaled)
+
+    fig, ax = plt.subplots(figsize=(7.0, 5.2))
     for cls in sorted(y_sub.unique()):
-        cls_mask = y_sub == cls
+        mask = y_sub == cls
         ax.scatter(
-            points[cls_mask, 0],
-            points[cls_mask, 1],
-            s=14,
-            alpha=0.75,
-            label=str(cls),
+            points[mask, 0],
+            points[mask, 1],
+            s=7,
+            alpha=0.65,
+            label=str(int(cls)),
         )
-
-    ax.set_title(f"PCA Projection (2D) - {len(X_sub)} Samples")
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
+    ax.set_title(f"Fashion-MNIST t-SNE (2D), n={len(X_sub)}")
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.grid(alpha=0.2)
     ax.legend(title="Class", ncol=2, fontsize=8)
-    ax.grid(alpha=0.25)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _make_digits_pixel_hist(X: pd.DataFrame) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(6.5, 3.5))
-    ax.hist(X.values.ravel(), bins=40, alpha=0.85)
-    ax.set_title("Pixel Intensity Distribution")
-    ax.set_xlabel("Pixel Value")
+def _fashion_pixel_hist(X: pd.DataFrame) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6.5, 3.6))
+    ax.hist(X.to_numpy().ravel(), bins=50, alpha=0.85)
+    ax.set_title("Fashion-MNIST Pixel Intensity Histogram")
+    ax.set_xlabel("Pixel Intensity")
     ax.set_ylabel("Frequency")
     ax.grid(alpha=0.25)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def make_eda_plots(data_bundle: Dict[str, Any], eda_params: Dict[str, Any]) -> Dict[str, Any]:
+def make_eda_plots(data_bundle: dict[str, Any], eda_params: dict[str, Any]) -> dict[str, Any]:
     X = data_bundle["X"]
     y = data_bundle["y"]
-    dataset_name = data_bundle["name"]
 
-    class_counts = y.value_counts().sort_index()
-    class_df = pd.DataFrame({"class": class_counts.index.astype(str), "count": class_counts.values})
-    shape_summary = pd.DataFrame(
+    shape_df = pd.DataFrame(
         [
             {
+                "dataset": data_bundle["name"],
                 "samples": int(X.shape[0]),
                 "features": int(X.shape[1]),
                 "classes": int(y.nunique()),
-                "dataset": dataset_name,
             }
         ]
     )
 
-    class_dist_fig = _make_class_distribution_plot(y, f"{dataset_name}: Class Distribution")
+    class_counts = y.value_counts().sort_index()
+    class_df = pd.DataFrame({"class": class_counts.index.astype(str), "count": class_counts.values})
 
-    if dataset_name == "Breast Cancer":
+    class_fig = _class_distribution_fig(y, f"{data_bundle['name']} Class Distribution")
+
+    if data_bundle["name"] == "Breast Cancer":
         top_k = int(eda_params.get("top_k", 10))
         top_n_stats = int(eda_params.get("top_n_stats", 10))
-        feature_1 = eda_params.get("feature_1", X.columns[0])
-        feature_2 = eda_params.get("feature_2", X.columns[min(1, len(X.columns) - 1)])
+        feature_1 = str(eda_params.get("feature_1", X.columns[0]))
+        feature_2 = str(eda_params.get("feature_2", X.columns[min(1, len(X.columns) - 1)]))
 
-        relation_fig = _make_breast_corr_heatmap(X, y, top_k)
-        extra_fig = _make_breast_feature_histograms(X, y, feature_1, feature_2, data_bundle["target_names"])
+        relation_fig = _breast_corr_heatmap(X, y, top_k)
+        extra_fig = _breast_hist_pair(X, y, feature_1, feature_2, data_bundle["target_names"])
 
-        stats_df = pd.DataFrame(
-            {
-                "feature": X.columns,
-                "mean": X.mean(numeric_only=True).values,
-                "std": X.std(numeric_only=True).values,
-            }
-        )
+        stats_df = pd.DataFrame({
+            "feature": X.columns,
+            "mean": X.mean(numeric_only=True).to_numpy(),
+            "std": X.std(numeric_only=True).to_numpy(),
+        })
         stats_df["abs_mean"] = stats_df["mean"].abs()
         stats_df = stats_df.sort_values("abs_mean", ascending=False).drop(columns=["abs_mean"]).head(top_n_stats)
 
-        flat_preview = X.head(5).copy()
-    else:
-        relation_fig = _make_digits_image_grid(X, y, data_bundle["image_shape"])
-        extra_fig = _make_digits_pca_plot(X, y, max_points=1000)
-
-        pixel_hist_fig = _make_digits_pixel_hist(X)
-        stats_df = class_df.copy()
-        stats_df.columns = ["digit", "count"]
-
-        flat_preview = X.head(5).copy()
+        flat_preview_df = X.head(8).copy()
 
         return {
-            "shape_df": shape_summary,
+            "shape_df": shape_df,
             "class_df": class_df,
-            "class_dist_fig": class_dist_fig,
+            "class_dist_fig": class_fig,
             "relation_fig": relation_fig,
             "extra_fig": extra_fig,
+            "pixel_hist_fig": None,
             "summary_stats_df": stats_df,
-            "flat_preview_df": flat_preview,
-            "digits_pixel_hist_fig": pixel_hist_fig,
+            "flat_preview_df": flat_preview_df,
         }
 
+    relation_fig = _fashion_image_grid(X, y, data_bundle["image_shape"])
+    extra_fig = _fashion_tsne_scatter(X, y, max_points=2500)
+    pixel_hist_fig = _fashion_pixel_hist(X)
+    stats_df = class_df.rename(columns={"class": "label", "count": "sample_count"})
+    flat_preview_df = X.head(8).copy()
+
     return {
-        "shape_df": shape_summary,
+        "shape_df": shape_df,
         "class_df": class_df,
-        "class_dist_fig": class_dist_fig,
+        "class_dist_fig": class_fig,
         "relation_fig": relation_fig,
         "extra_fig": extra_fig,
+        "pixel_hist_fig": pixel_hist_fig,
         "summary_stats_df": stats_df,
-        "flat_preview_df": flat_preview,
-        "digits_pixel_hist_fig": None,
+        "flat_preview_df": flat_preview_df,
     }
 
 
-def _parse_hidden_layers(hidden_layer_sizes: str) -> Tuple[int, ...]:
+def _parse_hidden_layers(hidden_layer_sizes: str) -> tuple[int, ...]:
     text = str(hidden_layer_sizes).strip()
     if not text:
         raise ValueError("MLP hidden_layer_sizes cannot be empty.")
-    values = [part.strip() for part in text.split(",") if part.strip()]
+    parts = [x.strip() for x in text.split(",") if x.strip()]
     try:
-        parsed = tuple(int(part) for part in values)
+        values = tuple(int(x) for x in parts)
     except ValueError as exc:
-        raise ValueError("MLP hidden layers must be comma-separated integers, e.g. 64,32") from exc
-    if any(v <= 0 for v in parsed):
+        raise ValueError("MLP hidden layers must be comma-separated integers, e.g., 64,32") from exc
+    if any(v <= 0 for v in values):
         raise ValueError("MLP hidden layers must be positive integers.")
-    return parsed
+    return values
 
 
-def build_models(config: Dict[str, Any], dataset_name: str) -> Dict[str, Pipeline]:
+def build_models(config: dict[str, Any], dataset_name: str) -> dict[str, Pipeline]:
     standardize = bool(config["standardize_features"])
-    use_pca_digits = bool(config["use_pca_digits"]) and dataset_name == "Digits"
+    use_pca = bool(config["use_pca_fashion"]) and dataset_name == "Fashion-MNIST"
     pca_components = int(config["pca_components"])
+    random_seed = int(config["random_seed"])
 
-    logreg_steps = []
-    mlp_steps = []
+    logreg_steps: list[tuple[str, Any]] = []
+    mlp_steps: list[tuple[str, Any]] = []
 
     if standardize:
         logreg_steps.append(("scaler", StandardScaler()))
         mlp_steps.append(("scaler", StandardScaler()))
 
-    if use_pca_digits:
-        logreg_steps.append(("pca", PCA(n_components=pca_components, random_state=int(config["random_seed"])) ))
-        mlp_steps.append(("pca", PCA(n_components=pca_components, random_state=int(config["random_seed"])) ))
+    if use_pca:
+        logreg_steps.append(("pca", PCA(n_components=pca_components, random_state=random_seed)))
+        mlp_steps.append(("pca", PCA(n_components=pca_components, random_state=random_seed)))
 
     logreg = LogisticRegression(
         C=float(config["logreg_c"]),
         max_iter=int(config["logreg_max_iter"]),
-        random_state=int(config["random_seed"]),
+        random_state=random_seed,
         solver="lbfgs",
-        n_jobs=-1,
+        multi_class="auto",
     )
     logreg_steps.append(("model", logreg))
 
     rf = RandomForestClassifier(
         n_estimators=int(config["rf_n_estimators"]),
         max_depth=None if int(config["rf_max_depth"]) <= 0 else int(config["rf_max_depth"]),
-        random_state=int(config["random_seed"]),
+        random_state=random_seed,
         n_jobs=-1,
     )
 
     gb = GradientBoostingClassifier(
         n_estimators=int(config["gb_n_estimators"]),
         learning_rate=float(config["gb_learning_rate"]),
-        random_state=int(config["random_seed"]),
+        random_state=random_seed,
     )
 
     mlp = MLPClassifier(
-        hidden_layer_sizes=_parse_hidden_layers(config["mlp_hidden_layer_sizes"]),
+        hidden_layer_sizes=_parse_hidden_layers(str(config["mlp_hidden_layer_sizes"])),
         alpha=float(config["mlp_alpha"]),
         max_iter=int(config["mlp_max_iter"]),
         early_stopping=bool(config["mlp_early_stopping"]),
-        random_state=int(config["random_seed"]),
+        random_state=random_seed,
     )
     mlp_steps.append(("model", mlp))
 
@@ -343,31 +442,33 @@ def build_models(config: Dict[str, Any], dataset_name: str) -> Dict[str, Pipelin
 
 
 def train_and_evaluate(
-    models: Dict[str, Pipeline],
+    models: dict[str, Pipeline],
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     y_train: pd.Series,
     y_test: pd.Series,
     dataset_name: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     average = "binary" if dataset_name == "Breast Cancer" else "weighted"
-    rows = []
-    details: Dict[str, Any] = {}
-    warnings_log: list[str] = []
+
+    metrics_rows: list[dict[str, Any]] = []
+    details: dict[str, Any] = {}
+    warn_logs: list[str] = []
 
     for model_name, model in models.items():
-        estimator = clone(model)
+        est = clone(model)
+
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            estimator.fit(X_train, y_train)
+            est.fit(X_train, y_train)
 
-        for item in caught:
-            message = f"[{model_name}] {item.category.__name__}: {item.message}"
-            warnings_log.append(message)
+        for warning_item in caught:
+            warn_logs.append(f"[{model_name}] {warning_item.category.__name__}: {warning_item.message}")
 
-        y_pred = estimator.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        precision, recall, f1, _ = precision_recall_fscore_support(
+        y_pred = est.predict(X_test)
+
+        acc = float(accuracy_score(y_test, y_pred))
+        prec, rec, f1, _ = precision_recall_fscore_support(
             y_test,
             y_pred,
             average=average,
@@ -376,76 +477,79 @@ def train_and_evaluate(
 
         row = {
             "Model": model_name,
-            "Accuracy": float(accuracy),
-            "Precision": float(precision),
-            "Recall": float(recall),
+            "Accuracy": float(acc),
+            "Precision": float(prec),
+            "Recall": float(rec),
             "F1": float(f1),
         }
 
-        auc_value = np.nan
         roc_payload = None
         if dataset_name == "Breast Cancer":
-            score_values = None
-            if hasattr(estimator, "predict_proba"):
-                probs = estimator.predict_proba(X_test)
+            score = None
+            if hasattr(est, "predict_proba"):
+                probs = est.predict_proba(X_test)
                 if probs.ndim == 2 and probs.shape[1] >= 2:
-                    score_values = probs[:, 1]
-            elif hasattr(estimator, "decision_function"):
-                score_values = estimator.decision_function(X_test)
+                    score = probs[:, 1]
+            elif hasattr(est, "decision_function"):
+                score = est.decision_function(X_test)
 
-            if score_values is not None:
-                fpr, tpr, _ = roc_curve(y_test, score_values)
-                auc_value = float(roc_auc_score(y_test, score_values))
-                roc_payload = {"fpr": fpr, "tpr": tpr, "auc": auc_value}
-                row["ROC_AUC"] = auc_value
+            if score is not None:
+                fpr, tpr, _ = roc_curve(y_test, score)
+                row["ROC_AUC"] = float(roc_auc_score(y_test, score))
+                roc_payload = {"fpr": fpr, "tpr": tpr, "auc": row["ROC_AUC"]}
             else:
                 row["ROC_AUC"] = np.nan
 
-        rows.append(row)
+        metrics_rows.append(row)
 
-        report = classification_report(
-            y_test,
-            y_pred,
-            target_names=[str(t) for t in sorted(y_test.unique())] if dataset_name == "Digits" else ["Malignant", "Benign"],
-            zero_division=0,
-        )
+        sorted_labels = sorted(y_test.unique())
+        target_names = [str(v) for v in sorted_labels]
+        if dataset_name == "Breast Cancer":
+            target_names = ["Malignant", "Benign"]
 
         details[model_name] = {
+            "report": classification_report(
+                y_test,
+                y_pred,
+                labels=sorted_labels,
+                target_names=target_names,
+                zero_division=0,
+            ),
             "y_true": y_test.to_numpy(),
             "y_pred": np.asarray(y_pred),
-            "report": report,
-            "confusion": confusion_matrix(y_test, y_pred),
+            "confusion": confusion_matrix(y_test, y_pred, labels=sorted_labels),
+            "labels": sorted_labels,
             "roc": roc_payload,
         }
 
-    metrics_df = pd.DataFrame(rows).sort_values("Accuracy", ascending=False).reset_index(drop=True)
-
+    metrics_df = pd.DataFrame(metrics_rows)
     metric_cols = ["Accuracy", "Precision", "Recall", "F1"]
-    metrics_for_rank = metrics_df[metric_cols].copy()
-    metrics_df["Overall"] = metrics_for_rank.mean(axis=1)
+    metrics_df["Overall"] = metrics_df[metric_cols].mean(axis=1)
+    metrics_df = metrics_df.sort_values("Overall", ascending=False).reset_index(drop=True)
 
-    best_per_metric = {}
-    for metric in metric_cols:
-        best_per_metric[metric] = metrics_df.loc[metrics_df[metric].idxmax(), "Model"]
-    best_overall = metrics_df.loc[metrics_df["Overall"].idxmax(), "Model"]
+    best_per_metric = {
+        metric: str(metrics_df.loc[metrics_df[metric].idxmax(), "Model"])
+        for metric in metric_cols
+    }
+    best_overall = str(metrics_df.loc[metrics_df["Overall"].idxmax(), "Model"])
 
     return {
         "metrics_df": metrics_df,
         "details": details,
-        "warnings": warnings_log,
+        "warnings": warn_logs,
         "best_per_metric": best_per_metric,
         "best_overall": best_overall,
     }
 
 
-def _build_confusion_figure(
+def _confusion_figure(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    labels: list[Any],
+    labels: list[int],
     title: str,
-    normalize: bool = False,
+    normalize: bool,
 ) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(5, 4.2))
+    fig, ax = plt.subplots(figsize=(5.8, 4.8))
     ConfusionMatrixDisplay.from_predictions(
         y_true,
         y_pred,
@@ -457,55 +561,77 @@ def _build_confusion_figure(
     )
     ax.set_title(title)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def _build_roc_figure(details: Dict[str, Any]) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(6, 4.2))
+def _roc_figure(details: dict[str, Any]) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6.2, 4.8))
     for model_name, payload in details.items():
-        roc = payload.get("roc")
-        if roc is None:
+        roc_payload = payload.get("roc")
+        if roc_payload is None:
             continue
-        ax.plot(roc["fpr"], roc["tpr"], label=f"{model_name} (AUC={roc['auc']:.3f})")
-
+        ax.plot(roc_payload["fpr"], roc_payload["tpr"], label=f"{model_name} (AUC={roc_payload['auc']:.3f})")
     ax.plot([0, 1], [0, 1], "k--", alpha=0.7)
     ax.set_title("ROC Curves (Breast Cancer)")
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
+    ax.grid(alpha=0.2)
     ax.legend(loc="lower right", fontsize=8)
-    ax.grid(alpha=0.25)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
-def render_results(result_bundle: Dict[str, Any], selected_model: str, dataset_name: str) -> Dict[str, Any]:
+def render_results(result_bundle: dict[str, Any], selected_model: str, dataset_name: str) -> dict[str, Any]:
     details = result_bundle["details"]
+    if not details:
+        return {
+            "metrics_df": pd.DataFrame(),
+            "comparison_df": pd.DataFrame(),
+            "conf_fig": None,
+            "report": "",
+            "roc_fig": None,
+            "norm_conf_fig": None,
+            "best_summary": "",
+        }
+
     if selected_model not in details:
         selected_model = next(iter(details.keys()))
 
     payload = details[selected_model]
-    labels = sorted(np.unique(payload["y_true"]))
 
-    conf_fig = _build_confusion_figure(
+    conf_fig = _confusion_figure(
         payload["y_true"],
         payload["y_pred"],
-        labels=labels,
-        title=f"Confusion Matrix - {selected_model}",
+        payload["labels"],
+        f"Confusion Matrix - {selected_model}",
         normalize=False,
     )
 
     norm_conf_fig = None
     roc_fig = None
-    if dataset_name == "Digits":
-        norm_conf_fig = _build_confusion_figure(
+    if dataset_name == "Fashion-MNIST":
+        norm_conf_fig = _confusion_figure(
             payload["y_true"],
             payload["y_pred"],
-            labels=labels,
-            title=f"Normalized Confusion Matrix - {selected_model}",
+            payload["labels"],
+            f"Normalized Confusion Matrix - {selected_model}",
             normalize=True,
         )
     else:
-        roc_fig = _build_roc_figure(details)
+        roc_fig = _roc_figure(details)
+
+    metric_cols = ["Accuracy", "Precision", "Recall", "F1", "Overall"]
+    metrics_df = result_bundle["metrics_df"].copy()
+    for col in metric_cols:
+        metrics_df[col] = metrics_df[col].map(lambda v: round(float(v), 4))
+
+    comparison_df = metrics_df.copy()
+    for metric in ["Accuracy", "Precision", "Recall", "F1", "Overall"]:
+        best_idx = comparison_df[metric].astype(float).idxmax()
+        comparison_df[metric] = comparison_df[metric].astype(str)
+        comparison_df.loc[best_idx, metric] = f"{comparison_df.loc[best_idx, metric]} ★"
 
     best = result_bundle["best_per_metric"]
     best_summary = (
@@ -516,28 +642,24 @@ def render_results(result_bundle: Dict[str, Any], selected_model: str, dataset_n
         f"Best Overall: {result_bundle['best_overall']}"
     )
 
-    display_df = result_bundle["metrics_df"].copy()
-    metric_cols = ["Accuracy", "Precision", "Recall", "F1", "Overall"]
-    for column in metric_cols:
-        display_df[column] = display_df[column].map(lambda value: round(float(value), 4))
-
     return {
-        "metrics_df": display_df,
+        "metrics_df": metrics_df,
+        "comparison_df": comparison_df,
         "conf_fig": conf_fig,
-        "report_text": payload["report"],
+        "report": payload["report"],
         "roc_fig": roc_fig,
         "norm_conf_fig": norm_conf_fig,
         "best_summary": best_summary,
     }
 
 
-def _normalize_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(config)
+def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
+    normalized = asdict(RunConfig(**raw))
     normalized["dataset"] = str(normalized["dataset"])
-    normalized["random_seed"] = int(normalized["random_seed"])
     normalized["test_size"] = float(normalized["test_size"])
+    normalized["random_seed"] = int(normalized["random_seed"])
     normalized["standardize_features"] = bool(normalized["standardize_features"])
-    normalized["use_pca_digits"] = bool(normalized["use_pca_digits"])
+    normalized["use_pca_fashion"] = bool(normalized["use_pca_fashion"])
     normalized["pca_components"] = int(normalized["pca_components"])
     normalized["fast_mode"] = bool(normalized["fast_mode"])
     normalized["logreg_c"] = float(normalized["logreg_c"])
@@ -553,60 +675,69 @@ def _normalize_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _hash_config(config: Dict[str, Any]) -> str:
-    encoded = json.dumps(config, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _apply_fast_mode(config: dict[str, Any]) -> dict[str, Any]:
+    if not config["fast_mode"]:
+        return config
+
+    cfg = dict(config)
+    cfg["logreg_max_iter"] = min(cfg["logreg_max_iter"], 250)
+    cfg["rf_n_estimators"] = min(cfg["rf_n_estimators"], 120)
+    cfg["gb_n_estimators"] = min(cfg["gb_n_estimators"], 120)
+    cfg["mlp_max_iter"] = min(cfg["mlp_max_iter"], 180)
+
+    if cfg["dataset"] == "Fashion-MNIST":
+        cfg["use_pca_fashion"] = True
+        cfg["pca_components"] = min(max(cfg["pca_components"], 10), 64)
+
+    return cfg
 
 
-def _validate_config(config: Dict[str, Any]) -> None:
+def _validate_config(config: dict[str, Any]) -> None:
+    if config["dataset"] not in {"Breast Cancer", "Fashion-MNIST"}:
+        raise ValueError("Dataset must be Breast Cancer or Fashion-MNIST.")
     if not (0.1 <= config["test_size"] <= 0.4):
         raise ValueError("Test size must be between 0.1 and 0.4.")
-    if config["dataset"] == "Digits" and config["use_pca_digits"]:
-        if not (10 <= config["pca_components"] <= 64):
-            raise ValueError("For Digits PCA, n_components must be between 10 and 64.")
-    if config["dataset"] == "Breast Cancer" and config["use_pca_digits"]:
-        raise ValueError("Use PCA for Digits applies only to the Digits dataset.")
+    if config["dataset"] == "Breast Cancer" and config["use_pca_fashion"]:
+        raise ValueError("Use PCA for Fashion-MNIST applies only to Fashion-MNIST.")
+    if config["dataset"] == "Fashion-MNIST" and not (10 <= config["pca_components"] <= 256):
+        raise ValueError("For Fashion-MNIST, PCA n_components must be between 10 and 256.")
+    if config["logreg_c"] <= 0:
+        raise ValueError("Logistic Regression C must be > 0.")
+    if config["rf_n_estimators"] < 10:
+        raise ValueError("Random Forest n_estimators must be at least 10.")
+    if config["gb_learning_rate"] <= 0:
+        raise ValueError("Gradient Boosting learning_rate must be > 0.")
     _parse_hidden_layers(config["mlp_hidden_layer_sizes"])
 
 
-def _apply_fast_mode(config: Dict[str, Any]) -> Dict[str, Any]:
-    updated = dict(config)
-    if not updated["fast_mode"]:
-        return updated
-
-    updated["logreg_max_iter"] = min(updated["logreg_max_iter"], 300)
-    updated["rf_n_estimators"] = min(updated["rf_n_estimators"], 120)
-    updated["gb_n_estimators"] = min(updated["gb_n_estimators"], 120)
-    updated["mlp_max_iter"] = min(updated["mlp_max_iter"], 200)
-    if updated["dataset"] == "Digits":
-        updated["use_pca_digits"] = True
-        updated["pca_components"] = min(max(updated["pca_components"], 10), 30)
-    return updated
+def _hash_config(config: dict[str, Any]) -> str:
+    text = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _save_exports(metrics_df: pd.DataFrame, config_json: str) -> Tuple[str, str]:
-    metrics_tmp = tempfile.NamedTemporaryFile(mode="w", suffix="_metrics.csv", delete=False)
-    config_tmp = tempfile.NamedTemporaryFile(mode="w", suffix="_config.json", delete=False)
-
-    metrics_df.to_csv(metrics_tmp.name, index=False)
-    metrics_tmp.close()
-
-    with open(config_tmp.name, "w", encoding="utf-8") as file:
-        file.write(config_json)
-
-    return metrics_tmp.name, config_tmp.name
-
-
-def _dataset_summary_markdown(data_bundle: Dict[str, Any]) -> str:
+def _dataset_summary(data_bundle: dict[str, Any]) -> str:
     X = data_bundle["X"]
     y = data_bundle["y"]
     return (
-        f"### Dataset Summary\n"
+        "### Dataset Summary\n"
         f"- Dataset: **{data_bundle['name']}**\n"
-        f"- Samples: **{len(X)}**\n"
-        f"- Features: **{X.shape[1]}**\n"
-        f"- Classes: **{y.nunique()}**\n"
+        f"- Shape: **{X.shape[0]} x {X.shape[1]}**\n"
+        f"- Classes: **{int(y.nunique())}**\n"
+        f"- Task: **{data_bundle['task_type']}**\n"
     )
+
+
+def _export_files(metrics_df: pd.DataFrame, config_json: str) -> tuple[str, str]:
+    metrics_file = tempfile.NamedTemporaryFile(mode="w", suffix="_metrics.csv", delete=False)
+    config_file = tempfile.NamedTemporaryFile(mode="w", suffix="_config.json", delete=False)
+
+    metrics_df.to_csv(metrics_file.name, index=False)
+    metrics_file.close()
+
+    with open(config_file.name, "w", encoding="utf-8") as handle:
+        handle.write(config_json)
+
+    return metrics_file.name, config_file.name
 
 
 def refresh_dataset_and_eda(
@@ -615,43 +746,41 @@ def refresh_dataset_and_eda(
     feature_1: str,
     feature_2: str,
     top_n_stats: int,
-) -> Tuple[Any, ...]:
+) -> tuple[Any, ...]:
     data_bundle = load_dataset(dataset_name)
-    feature_names = data_bundle["feature_names"]
+    features = data_bundle["feature_names"]
 
     if data_bundle["name"] == "Breast Cancer":
-        feature_1 = feature_1 if feature_1 in feature_names else feature_names[0]
-        feature_2 = feature_2 if feature_2 in feature_names else feature_names[min(1, len(feature_names) - 1)]
-        feature_1_update = gr.update(choices=feature_names, value=feature_1, interactive=True)
-        feature_2_update = gr.update(choices=feature_names, value=feature_2, interactive=True)
+        f1 = feature_1 if feature_1 in features else features[0]
+        f2 = feature_2 if feature_2 in features else features[min(1, len(features) - 1)]
+        f1_update = gr.update(choices=features, value=f1, interactive=True)
+        f2_update = gr.update(choices=features, value=f2, interactive=True)
     else:
-        feature_1_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
-        feature_2_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
+        f1_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
+        f2_update = gr.update(choices=["N/A"], value="N/A", interactive=False)
 
     eda = make_eda_plots(
         data_bundle,
         {
-            "top_k": top_k,
+            "top_k": int(top_k),
             "feature_1": feature_1,
             "feature_2": feature_2,
-            "top_n_stats": top_n_stats,
+            "top_n_stats": int(top_n_stats),
         },
     )
 
-    digits_pixel_fig = eda["digits_pixel_hist_fig"] if data_bundle["name"] == "Digits" else None
-
     return (
-        _dataset_summary_markdown(data_bundle),
+        _dataset_summary(data_bundle),
         eda["shape_df"],
         eda["class_df"],
         eda["class_dist_fig"],
         eda["relation_fig"],
         eda["extra_fig"],
-        digits_pixel_fig,
+        gr.update(visible=(data_bundle["name"] == "Fashion-MNIST"), value=eda["pixel_hist_fig"]),
         eda["summary_stats_df"],
         eda["flat_preview_df"],
-        feature_1_update,
-        feature_2_update,
+        f1_update,
+        f2_update,
     )
 
 
@@ -660,7 +789,7 @@ def run_training(
     test_size: float,
     random_seed: int,
     standardize_features: bool,
-    use_pca_digits: bool,
+    use_pca_fashion: bool,
     pca_components: int,
     fast_mode: bool,
     logreg_c: float,
@@ -674,13 +803,13 @@ def run_training(
     mlp_max_iter: int,
     mlp_early_stopping: bool,
     progress=gr.Progress(track_tqdm=False),
-) -> Tuple[Any, ...]:
-    raw_config = {
+) -> tuple[Any, ...]:
+    raw = {
         "dataset": dataset,
         "test_size": test_size,
         "random_seed": random_seed,
         "standardize_features": standardize_features,
-        "use_pca_digits": use_pca_digits,
+        "use_pca_fashion": use_pca_fashion,
         "pca_components": pca_components,
         "fast_mode": fast_mode,
         "logreg_c": logreg_c,
@@ -695,17 +824,20 @@ def run_training(
         "mlp_early_stopping": mlp_early_stopping,
     }
 
+    empty_metrics = pd.DataFrame(columns=["Model", "Accuracy", "Precision", "Recall", "F1", "Overall"])
+    empty_comp = pd.DataFrame(columns=["Model", "Accuracy", "Precision", "Recall", "F1", "Overall"])
+
     try:
-        config = _normalize_training_config(raw_config)
+        config = _normalize_config(raw)
         config = _apply_fast_mode(config)
         _validate_config(config)
     except Exception as exc:
-        empty_df = pd.DataFrame(columns=["Model", "Accuracy", "Precision", "Recall", "F1", "Overall"])
-        error_msg = f"Validation error: {exc}"
+        msg = f"Validation error: {exc}"
         return (
-            empty_df,
+            empty_metrics,
+            empty_comp,
             "",
-            error_msg,
+            msg,
             "",
             gr.update(choices=[], value=None),
             None,
@@ -725,22 +857,20 @@ def run_training(
     if cache_key in TRAIN_CACHE:
         cached = TRAIN_CACHE[cache_key]
         rendered = render_results(cached["result_bundle"], cached["selected_model"], config["dataset"])
-
-        metrics_path, config_path = _save_exports(rendered["metrics_df"], config_json)
-        status_text = "Cache hit: reused previous training results."
+        metrics_path, config_path = _export_files(rendered["metrics_df"], config_json)
         warnings_text = "\n".join(cached["result_bundle"]["warnings"]) if cached["result_bundle"]["warnings"] else "No warnings."
-
         progress(1.0, desc="Done (cached)")
         return (
             rendered["metrics_df"],
+            rendered["comparison_df"],
             rendered["best_summary"],
-            status_text,
-            config_json,
+            "Cache hit: reused previous training results.",
+            warnings_text,
             gr.update(choices=list(cached["result_bundle"]["details"].keys()), value=cached["selected_model"]),
             rendered["conf_fig"],
-            rendered["report_text"],
+            rendered["report"],
             gr.update(visible=(config["dataset"] == "Breast Cancer"), value=rendered["roc_fig"]),
-            gr.update(visible=(config["dataset"] == "Digits"), value=rendered["norm_conf_fig"]),
+            gr.update(visible=(config["dataset"] == "Fashion-MNIST"), value=rendered["norm_conf_fig"]),
             metrics_path,
             config_path,
             cached["result_bundle"],
@@ -751,7 +881,6 @@ def run_training(
     y = data_bundle["y"]
 
     progress(0.2, desc="Splitting train/test")
-
     stratify = y if y.nunique() > 1 else None
     X_train, X_test, y_train, y_test = train_test_split(
         X,
@@ -765,19 +894,11 @@ def run_training(
     models = build_models(config, config["dataset"])
 
     progress(0.55, desc="Training and evaluating models")
-    result_bundle = train_and_evaluate(
-        models=models,
-        X_train=X_train,
-        X_test=X_test,
-        y_train=y_train,
-        y_test=y_test,
-        dataset_name=config["dataset"],
-    )
+    result_bundle = train_and_evaluate(models, X_train, X_test, y_train, y_test, config["dataset"])
 
     selected_model = result_bundle["best_overall"]
     rendered = render_results(result_bundle, selected_model, config["dataset"])
-
-    metrics_path, config_path = _save_exports(rendered["metrics_df"], config_json)
+    metrics_path, config_path = _export_files(rendered["metrics_df"], config_json)
 
     TRAIN_CACHE[cache_key] = {
         "result_bundle": result_bundle,
@@ -785,41 +906,41 @@ def run_training(
     }
 
     warnings_text = "\n".join(result_bundle["warnings"]) if result_bundle["warnings"] else "No warnings."
-    status_text = "Training completed and cached."
-
     progress(1.0, desc="Done")
+
     return (
         rendered["metrics_df"],
+        rendered["comparison_df"],
         rendered["best_summary"],
-        status_text,
-        config_json,
+        "Training completed and cached.",
+        warnings_text,
         gr.update(choices=list(result_bundle["details"].keys()), value=selected_model),
         rendered["conf_fig"],
-        rendered["report_text"],
+        rendered["report"],
         gr.update(visible=(config["dataset"] == "Breast Cancer"), value=rendered["roc_fig"]),
-        gr.update(visible=(config["dataset"] == "Digits"), value=rendered["norm_conf_fig"]),
+        gr.update(visible=(config["dataset"] == "Fashion-MNIST"), value=rendered["norm_conf_fig"]),
         metrics_path,
         config_path,
         result_bundle,
     )
 
 
-def on_model_selection_change(
-    selected_model: str,
-    dataset_name: str,
-    result_state: Dict[str, Any],
-) -> Tuple[Any, ...]:
+def on_model_change(selected_model: str, dataset: str, result_state: dict[str, Any]) -> tuple[Any, ...]:
     if not result_state:
         return None, "", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
-    rendered = render_results(result_state, selected_model, dataset_name)
-
+    rendered = render_results(result_state, selected_model, dataset)
     return (
         rendered["conf_fig"],
-        rendered["report_text"],
-        gr.update(visible=(dataset_name == "Breast Cancer"), value=rendered["roc_fig"]),
-        gr.update(visible=(dataset_name == "Digits"), value=rendered["norm_conf_fig"]),
+        rendered["report"],
+        gr.update(visible=(dataset == "Breast Cancer"), value=rendered["roc_fig"]),
+        gr.update(visible=(dataset == "Fashion-MNIST"), value=rendered["norm_conf_fig"]),
     )
+
+
+def _standardize_default_for_dataset(ds_name: str) -> gr.update:
+    # default on for both datasets (for linear/MLP paths)
+    return gr.update(value=True)
 
 
 def build_app() -> gr.Blocks:
@@ -832,40 +953,38 @@ def build_app() -> gr.Blocks:
             with gr.Column(scale=1):
                 gr.Markdown("## Dataset")
                 dataset = gr.Radio(
-                    choices=["Breast Cancer", "Digits"],
+                    choices=["Breast Cancer", "Fashion-MNIST"],
                     value="Breast Cancer",
-                    label="Select Dataset",
+                    label="Choose dataset",
                 )
-                dataset_summary_md = gr.Markdown()
-                shape_df = gr.Dataframe(label="Dataset Shape Summary", interactive=False)
+                dataset_summary = gr.Markdown()
+                shape_df = gr.Dataframe(label="Dataset Shape", interactive=False)
                 class_df = gr.Dataframe(label="Class Counts", interactive=False)
 
                 gr.Markdown("## EDA / Visualizations")
-                top_k = gr.Slider(2, 20, value=10, step=1, label="Breast Cancer: Top-k Correlated Features")
-                feature_1 = gr.Dropdown(choices=[], label="Breast Cancer: Histogram Feature 1")
-                feature_2 = gr.Dropdown(choices=[], label="Breast Cancer: Histogram Feature 2")
-                top_n_stats = gr.Slider(5, 20, value=10, step=1, label="Summary Stats: Top N Features")
+                top_k = gr.Slider(2, 20, value=10, step=1, label="Breast Cancer: Top-k correlated features")
+                feature_1 = gr.Dropdown(choices=[], label="Breast Cancer: Histogram feature 1")
+                feature_2 = gr.Dropdown(choices=[], label="Breast Cancer: Histogram feature 2")
+                top_n_stats = gr.Slider(5, 25, value=10, step=1, label="Summary stats: Top N")
 
             with gr.Column(scale=2):
                 class_dist_fig = gr.Plot(label="Class Distribution")
                 relation_fig = gr.Plot(label="Relationship Plot")
-                extra_fig = gr.Plot(label="Additional EDA Plot")
-                digits_pixel_fig = gr.Plot(label="Digits: Pixel Intensity Histogram")
+                extra_fig = gr.Plot(label="Additional Plot")
+                pixel_hist_fig = gr.Plot(label="Fashion-MNIST Pixel Histogram", visible=False)
                 summary_stats_df = gr.Dataframe(label="Summary Statistics", interactive=False)
                 flat_preview_df = gr.Dataframe(label="Flattened Feature Preview", interactive=False)
 
+        gr.Markdown("## Training")
         with gr.Row():
-            gr.Markdown("## Training")
+            test_size = gr.Slider(0.1, 0.4, value=0.2, step=0.01, label="Test size")
+            random_seed = gr.Number(value=42, precision=0, label="Random seed")
+            standardize_features = gr.Checkbox(value=True, label="Standardize features")
+            fast_mode = gr.Checkbox(value=False, label="Fast mode")
 
         with gr.Row():
-            test_size = gr.Slider(0.1, 0.4, value=0.2, step=0.01, label="Test Size")
-            random_seed = gr.Number(value=42, precision=0, label="Random Seed")
-            standardize_features = gr.Checkbox(value=True, label="Standardize Features")
-            fast_mode = gr.Checkbox(value=False, label="Fast Mode")
-
-        with gr.Row():
-            use_pca_digits = gr.Checkbox(value=False, label="Use PCA for Digits (LogReg/MLP only)")
-            pca_components = gr.Slider(10, 64, value=32, step=1, label="Digits PCA Components")
+            use_pca_fashion = gr.Checkbox(value=False, label="Use PCA for Fashion-MNIST (LogReg/MLP only)")
+            pca_components = gr.Slider(10, 256, value=64, step=1, label="Fashion-MNIST PCA components")
 
         with gr.Row():
             logreg_c = gr.Slider(0.01, 10.0, value=1.0, step=0.01, label="Logistic Regression: C")
@@ -873,137 +992,65 @@ def build_app() -> gr.Blocks:
 
         with gr.Row():
             rf_n_estimators = gr.Slider(50, 1000, value=300, step=10, label="Random Forest: n_estimators")
-            rf_max_depth = gr.Slider(0, 40, value=0, step=1, label="Random Forest: max_depth (0=None)")
+            rf_max_depth = gr.Slider(0, 50, value=0, step=1, label="Random Forest: max_depth (0=None)")
 
         with gr.Row():
-            gb_n_estimators = gr.Slider(50, 1000, value=300, step=10, label="Gradient Boosting: n_estimators")
+            gb_n_estimators = gr.Slider(50, 1000, value=250, step=10, label="Gradient Boosting: n_estimators")
             gb_learning_rate = gr.Slider(0.01, 0.5, value=0.05, step=0.01, label="Gradient Boosting: learning_rate")
 
         with gr.Row():
             mlp_hidden_layer_sizes = gr.Textbox(value="64,32", label="MLP: hidden_layer_sizes")
             mlp_alpha = gr.Slider(1e-6, 1e-1, value=1e-4, step=1e-6, label="MLP: alpha")
-            mlp_max_iter = gr.Slider(100, 2000, value=600, step=50, label="MLP: max_iter")
+            mlp_max_iter = gr.Slider(100, 2000, value=500, step=50, label="MLP: max_iter")
             mlp_early_stopping = gr.Checkbox(value=True, label="MLP: early_stopping")
 
         train_btn = gr.Button("Train & Evaluate", variant="primary")
 
         gr.Markdown("## Results")
-        model_selector = gr.Dropdown(choices=[], label="Select Model for Detailed Results")
+        model_selector = gr.Dropdown(choices=[], label="Model for confusion matrix/report")
         conf_fig = gr.Plot(label="Confusion Matrix")
-        classification_report_box = gr.Textbox(label="Classification Report", lines=14)
-
-        roc_fig = gr.Plot(label="Breast Cancer: ROC Curves", visible=False)
-        norm_conf_fig = gr.Plot(label="Digits: Normalized Confusion Matrix", visible=False)
+        report_box = gr.Textbox(label="Classification Report", lines=14)
+        roc_fig = gr.Plot(label="Breast Cancer ROC + AUC", visible=False)
+        norm_conf_fig = gr.Plot(label="Fashion-MNIST Normalized Confusion Matrix", visible=False)
 
         gr.Markdown("## Model Comparison")
         metrics_df = gr.Dataframe(label="Metrics Table", interactive=False)
-        best_summary_box = gr.Textbox(label="Best Model Summary")
+        comparison_df = gr.Dataframe(label="Best-per-metric Highlighted", interactive=False)
+        best_summary = gr.Textbox(label="Best Models Summary")
 
         gr.Markdown("## Downloads/Logs")
-        status_box = gr.Textbox(label="Status / Progress", lines=2)
         config_box = gr.Textbox(label="Run Configuration (JSON)", lines=14)
+        status_box = gr.Textbox(label="Status / Progress", lines=2)
+        warnings_box = gr.Textbox(label="Warnings / Logs", lines=8)
         metrics_download = gr.File(label="Download Metrics CSV")
         config_download = gr.File(label="Download Config JSON")
 
-        def _refresh_standardize_default(ds_name: str):
-            default_value = True
-            return gr.update(value=default_value)
-
         dataset.change(
-            fn=_refresh_standardize_default,
+            fn=_standardize_default_for_dataset,
             inputs=[dataset],
             outputs=[standardize_features],
         )
 
-        dataset.change(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
+        refresh_inputs = [dataset, top_k, feature_1, feature_2, top_n_stats]
+        refresh_outputs = [
+            dataset_summary,
+            shape_df,
+            class_df,
+            class_dist_fig,
+            relation_fig,
+            extra_fig,
+            pixel_hist_fig,
+            summary_stats_df,
+            flat_preview_df,
+            feature_1,
+            feature_2,
+        ]
 
-        top_k.change(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
-
-        feature_1.change(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
-
-        feature_2.change(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
-
-        top_n_stats.change(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
+        dataset.change(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
+        top_k.change(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
+        feature_1.change(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
+        feature_2.change(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
+        top_n_stats.change(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
 
         train_btn.click(
             fn=run_training,
@@ -1012,7 +1059,7 @@ def build_app() -> gr.Blocks:
                 test_size,
                 random_seed,
                 standardize_features,
-                use_pca_digits,
+                use_pca_fashion,
                 pca_components,
                 fast_mode,
                 logreg_c,
@@ -1028,12 +1075,13 @@ def build_app() -> gr.Blocks:
             ],
             outputs=[
                 metrics_df,
-                best_summary_box,
+                comparison_df,
+                best_summary,
                 status_box,
-                config_box,
+                warnings_box,
                 model_selector,
                 conf_fig,
-                classification_report_box,
+                report_box,
                 roc_fig,
                 norm_conf_fig,
                 metrics_download,
@@ -1043,28 +1091,12 @@ def build_app() -> gr.Blocks:
         )
 
         model_selector.change(
-            fn=on_model_selection_change,
+            fn=on_model_change,
             inputs=[model_selector, dataset, result_state],
-            outputs=[conf_fig, classification_report_box, roc_fig, norm_conf_fig],
+            outputs=[conf_fig, report_box, roc_fig, norm_conf_fig],
         )
 
-        demo.load(
-            fn=refresh_dataset_and_eda,
-            inputs=[dataset, top_k, feature_1, feature_2, top_n_stats],
-            outputs=[
-                dataset_summary_md,
-                shape_df,
-                class_df,
-                class_dist_fig,
-                relation_fig,
-                extra_fig,
-                digits_pixel_fig,
-                summary_stats_df,
-                flat_preview_df,
-                feature_1,
-                feature_2,
-            ],
-        )
+        demo.load(fn=refresh_dataset_and_eda, inputs=refresh_inputs, outputs=refresh_outputs)
 
     return demo
 

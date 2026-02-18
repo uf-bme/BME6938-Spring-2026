@@ -1,0 +1,85 @@
+You are an expert Python engineer and ML educator. Create a single-file **Gradio** app (Python) that lets users explore and benchmark classical ML models on **two datasets**: (1) **Breast Cancer Wisconsin Diagnostic** (`sklearn.datasets.load_breast_cancer`) and (2) **Fashion-MNIST** via `sklearn.datasets.fetch_openml("Fashion-MNIST", version=1, as_frame=False)`. The UI must include a **dataset toggle** (radio or tabs) so users can switch between Breast Cancer and Fashion-MNIST at any time.
+
+Core requirements
+- Use Gradio `Blocks` layout with a clean, organized UI and clear section headers: **Dataset**, **EDA / Visualizations**, **Training**, **Results**, **Model Comparison**, **Downloads/Logs**.
+- On dataset switch, refresh dataset summary + EDA plots appropriately.
+- Implement a **“Train & Evaluate”** button that trains **four models** on the currently selected dataset:
+  1) Logistic Regression
+  2) Random Forest
+  3) Gradient Boosting
+  4) MLP (Multi-layer Perceptron)
+- Use a consistent train/test split (default `test_size=0.2`, `random_state=42`, stratified when possible).
+- Compute and display on the test set for each model: **accuracy, precision, recall, f1**.
+  - For metrics: use weighted averaging for multiclass (Fashion-MNIST) and binary averaging for Breast Cancer.
+- Show a clear **comparison table** across models and highlight the best model per metric (or overall).
+- Provide sensible defaults but allow key settings to be changed from the UI.
+
+Dataset handling
+- Breast Cancer:
+  - Features: tabular numeric, labels binary.
+  - Standardize features (e.g., `StandardScaler`) for models that benefit from it (LogReg, MLP).
+- Fashion-MNIST:
+  - Features: 28x28 grayscale images flattened to vectors; labels 0–9.
+  - Provide both flattened view and image view for EDA.
+  - Standardize or scale features for LogReg/MLP; keep trees unscaled.
+- Use scikit-learn `Pipeline` objects for preprocessing + model.
+
+EDA / Visualization requirements (must generate plots in-app)
+For each dataset, produce a small set of informative plots (matplotlib only; no seaborn unless you must):
+- Always show:
+  - Dataset shape, number of classes, class distribution bar chart.
+  - A correlation/relationship plot suitable for the dataset:
+    - Breast Cancer: correlation heatmap of top-k correlated features (user-selectable k), plus a pair of feature histograms (user-selectable features).
+    - Fashion-MNIST: a grid of sample images with labels, plus a 2D projection (PCA to 2 components) scatter plot colored by class (subsample if needed).
+- Show summary statistics:
+  - Breast Cancer: per-feature mean/std table (top N features).
+  - Fashion-MNIST: pixel intensity histogram + per-class sample counts.
+- All plots should update when the dataset toggle changes.
+
+Training UI controls
+Include controls for:
+- Test size slider (0.1–0.4)
+- Random seed input
+- Option: “Standardize features” checkbox (default on for Breast Cancer, on for Fashion-MNIST for linear/MLP only)
+- Optional: “Use PCA for Fashion-MNIST” checkbox + n_components slider (e.g., 10–256) applied only to LogReg/MLP pipelines
+- Model hyperparameters (keep minimal but useful):
+  - Logistic Regression: C, max_iter
+  - Random Forest: n_estimators, max_depth
+  - Gradient Boosting: n_estimators, learning_rate
+  - MLP: hidden_layer_sizes, alpha, max_iter, early_stopping toggle
+- Include a “Fast mode” toggle that uses smaller settings for quick demos (e.g., fewer estimators, fewer iterations).
+
+Results / Comparison outputs
+- Display:
+  - Metrics table (rows=models, cols=accuracy/precision/recall/f1)
+  - Confusion matrix for the selected model (dropdown to choose which model’s confusion matrix to view)
+  - Classification report text for the selected model
+- Add optional plots:
+  - Breast Cancer: ROC curve + AUC for each model (binary only)
+  - Fashion-MNIST: normalized confusion matrix heatmap
+
+Additional features to include (do these)
+- Caching: avoid retraining if the user reruns with identical settings (hash settings + dataset).
+- Progress feedback: show a status/progress textbox and/or Gradio progress.
+- Reproducibility: show the exact config used for the run (as JSON in a textbox).
+- Export: allow users to download the metrics table as CSV and the config as JSON.
+- Robustness:
+  - Handle convergence warnings gracefully (display warnings in the UI without crashing).
+  - Validate UI inputs and show friendly error messages.
+- Performance:
+  - Use `n_jobs=-1` where available (e.g., RandomForest).
+  - For Fashion-MNIST PCA scatter, subsample if too many points.
+
+Implementation constraints
+- Write idiomatic, production-quality Python with clear functions:
+  - `load_dataset(name)`
+  - `make_eda_plots(data_bundle, eda_params)`
+  - `build_models(config, dataset_name)`
+  - `train_and_evaluate(models, X_train, X_test, y_train, y_test, dataset_name)`
+  - `render_results(...)`
+- Use only common libraries: `gradio`, `numpy`, `pandas`, `matplotlib`, `scikit-learn`.
+- Make sure the app runs with `python app.py` and launches Gradio.
+- Put everything in one file and include a short header comment explaining how to run it.
+
+Deliverable
+- Output ONLY the final Python code for `app.py` (no extra commentary).
